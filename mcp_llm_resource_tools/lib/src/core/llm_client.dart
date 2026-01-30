@@ -32,6 +32,9 @@ class LlmClient {
   /// Whether deferred loading is enabled
   final bool _useDeferredLoading;
 
+  /// Maximum number of tool calling rounds
+  final int _maxToolRounds;
+
   /// Storage manager
   final StorageManager? storageManager;
 
@@ -68,11 +71,13 @@ class LlmClient {
     bool enableEnhancedErrorHandling = true, // Enable enhanced error handling (2025-03-26)
     bool enableDebugLogging = false, // Enable debug logging (2025-03-26)
     bool useDeferredLoading = false, // Enable deferred tool loading (opt-in)
+    int maxToolRounds = 1, // Maximum tool calling rounds (1 = single round)
   })
       : _mcpClientManager = _initMcpClientManager(mcpClient, mcpClients),
         pluginManager = pluginManager ?? PluginManager(),
         _performanceMonitor = performanceMonitor ?? PerformanceMonitor(),
-        _useDeferredLoading = useDeferredLoading {
+        _useDeferredLoading = useDeferredLoading,
+        _maxToolRounds = maxToolRounds.clamp(1, 10) {
     
     // Initialize logging configuration (2025-03-26)
     if (enableDebugLogging) {
@@ -593,8 +598,9 @@ class LlmClient {
       // Send request to LLM
       LlmResponse response = await llmProvider.complete(request);
 
-      // Add to chat session only if there's initial text
-      if (response.text.isNotEmpty) {
+      // Add to chat session only if there's text AND no tool calls
+      // When tool calls exist, _handleToolCalls stores the structured assistant message
+      if (response.text.isNotEmpty && (response.toolCalls == null || response.toolCalls!.isEmpty)) {
         chatSession.addAssistantMessage(response.text);
       }
 
@@ -806,8 +812,9 @@ class LlmClient {
           toolCalls: collectedToolCalls,
         );
 
-        // Add the initial response to chat session
-        if (fullResponse.text.isNotEmpty) {
+        // Add the initial response to chat session only if no tool calls
+        // When tool calls exist, _handleToolCalls stores the structured assistant message
+        if (fullResponse.text.isNotEmpty && (fullResponse.toolCalls == null || fullResponse.toolCalls!.isEmpty)) {
           chatSession.addAssistantMessage(fullResponse.text);
         }
 
@@ -938,143 +945,157 @@ class LlmClient {
     }
   }
 
-  /// Handle tool calls in response
+  /// Handle tool calls in response with multi-round support
   Future<LlmResponse> _handleToolCalls(LlmResponse response,
       String userInput,
       bool enableTools,
       bool enablePlugins,
       Map<String, dynamic> parameters,
       LlmContext? context) async {
-    // Tool call validation - filter tool calls without arguments
-    final validToolCalls = <LlmToolCall>[];
 
-    final Set<String> processedSignatures = {};
+    for (int round = 0; round < _maxToolRounds; round++) {
+      _logger.debug('Tool round ${round + 1}/$_maxToolRounds');
 
-    for (final toolCall in response.toolCalls!) {
-      // Skip tool calls with empty arguments
-      if (toolCall.arguments.isEmpty) {
-        _logger.warning('Skipping empty tool call for "${toolCall.name}" - no arguments provided');
-        continue;
+      // Tool call validation - filter tool calls without arguments
+      final validToolCalls = <LlmToolCall>[];
+      final Set<String> processedSignatures = {};
+
+      for (final toolCall in response.toolCalls!) {
+        if (toolCall.arguments.isEmpty) {
+          _logger.warning('Skipping empty tool call for "${toolCall.name}" - no arguments provided');
+          continue;
+        }
+
+        final signature = '${toolCall.name}:${jsonEncode(toolCall.arguments)}';
+        if (processedSignatures.contains(signature)) {
+          _logger.warning('Skipping duplicate tool call for "${toolCall.name}" with identical arguments');
+          continue;
+        }
+
+        processedSignatures.add(signature);
+        validToolCalls.add(toolCall);
+        _logger.debug('Add tool call for ${toolCall.name}:${jsonEncode(toolCall.arguments)}');
       }
 
-      // Generate tool call signature (tool name + hash of argument values)
-      final signature = '${toolCall.name}:${jsonEncode(toolCall.arguments)}';
-
-      // Skip tool calls with identical signatures that have already been processed
-      if (processedSignatures.contains(signature)) {
-        _logger.warning('Skipping duplicate tool call for "${toolCall.name}" with identical arguments');
-        continue;
+      if (validToolCalls.isEmpty) {
+        _logger.warning('All tool calls had empty arguments - skipping tool execution');
+        return LlmResponse(
+          text: "I tried to use tools to help answer your question, but couldn't complete the process. Could you please provide more specific information?",
+          metadata: {'error': 'empty_tool_calls'},
+        );
       }
 
-      // Add signature and register as valid tool call
-      processedSignatures.add(signature);
-      validToolCalls.add(toolCall);
-      _logger.debug('Add tool call for ${toolCall.name}:${jsonEncode(toolCall.arguments)}');
-    }
-
-    // Stop processing if there are no valid tool calls
-    if (validToolCalls.isEmpty) {
-      // Return error message if all tool calls are empty
-      _logger.warning('All tool calls had empty arguments - skipping tool execution');
-      return LlmResponse(
-        text: "I tried to use tools to help answer your question, but couldn't complete the process. Could you please provide more specific information?",
-        metadata: {'error': 'empty_tool_calls'},
+      // Store assistant message with tool_calls metadata
+      final assistantMessage = LlmMessage(
+        role: 'assistant',
+        content: {
+          'tool_calls': validToolCalls.map((tc) => {
+            'id': tc.id ?? 'call_${DateTime.now().millisecondsSinceEpoch}',
+            'name': tc.name,
+            'arguments': tc.arguments,
+          }).toList(),
+        },
+        metadata: {'tool_call': true},
       );
-    }
+      chatSession.addToolMessage(assistantMessage);
 
-    // Tool call result map (ID -> result)
-    final Map<String, dynamic> toolResults = {};
-    final Map<String, String> toolErrors = {};
+      // Execute all valid tools
+      final Map<String, dynamic> toolResults = {};
+      final Map<String, String> toolErrors = {};
 
-    // Execute all valid tools
-    for (final toolCall in validToolCalls) {
-      final toolId = toolCall.id ?? 'call_${DateTime.now().millisecondsSinceEpoch}';
+      for (final toolCall in validToolCalls) {
+        final toolId = toolCall.id ?? 'call_${DateTime.now().millisecondsSinceEpoch}';
 
-      try {
-        // Execute tool
-        final toolResult = await executeTool(
-          toolCall.name,
-          toolCall.arguments,
+        try {
+          final toolResult = await executeTool(
+            toolCall.name,
+            toolCall.arguments,
+            enableMcpTools: enableTools,
+            enablePlugins: enablePlugins,
+          );
+
+          toolResults[toolId] = toolResult;
+
+          chatSession.addToolResult(
+            toolCall.name,
+            toolCall.arguments,
+            [toolResult],
+            toolCallId: toolId,
+          );
+          _logger.debug('toolResult $toolResult');
+        } catch (e) {
+          _logger.error('Error executing tool ${toolCall.name}: $e');
+
+          toolErrors[toolId] = e.toString();
+
+          chatSession.addToolError(
+            toolCall.name,
+            e.toString(),
+            toolCallId: toolId,
+          );
+        }
+      }
+
+      // Return error if all tools failed
+      if (toolResults.isEmpty && toolErrors.isNotEmpty) {
+        final firstErrorEntry = toolErrors.entries.first;
+        return LlmResponse(
+          text: "I tried to use a tool, but encountered an error: ${firstErrorEntry.value}",
+          metadata: {'error': firstErrorEntry.value, 'tool_call_id': firstErrorEntry.key},
+        );
+      }
+
+      // Create follow-up request with tool results
+      if (toolResults.isNotEmpty) {
+        final toolResultsInfo = toolResults.entries.map((entry) =>
+        "Tool result for call ${entry.key}: ${entry.value}").join("\n");
+
+        // Collect tools for follow-up request
+        final availableTools = await _collectAvailableTools(
           enableMcpTools: enableTools,
           enablePlugins: enablePlugins,
         );
 
-        // Save to result map
-        toolResults[toolId] = toolResult;
+        final followUpParameters = Map<String, dynamic>.from(parameters);
+        if (availableTools.isNotEmpty) {
+          final toolDescriptions = availableTools.map((tool) => {
+            'name': tool['name'],
+            'description': tool['description'],
+            'parameters': tool['inputSchema'],
+          }).toList();
+          followUpParameters['tools'] = toolDescriptions;
+        }
 
-        // Add tool result to session
-        chatSession.addToolResult(
-          toolCall.name,
-          toolCall.arguments,
-          [toolResult],
-          toolCallId: toolId,  // Pass ID
+        final followUpRequest = LlmRequest(
+          prompt: "Based on the tool results, answer the original question: \"$userInput\"\n\nTool results:\n$toolResultsInfo",
+          history: chatSession.getMessagesForContext(),
+          parameters: followUpParameters,
+          context: context,
         );
-        _logger.debug('toolResult $toolResult');
-      } catch (e) {
-        _logger.error('Error executing tool ${toolCall.name}: $e');
 
-        // Save to error map
-        toolErrors[toolId] = e.toString();
+        try {
+          response = await llmProvider.complete(followUpRequest);
+        } catch (e) {
+          _logger.error('Error getting follow-up response: $e');
+          return LlmResponse(
+            text: "I tried to use tools to answer your question, but encountered an error processing the results: $e",
+            metadata: {'error': e.toString()},
+          );
+        }
 
-        // Add tool error to session
-        chatSession.addToolError(
-          toolCall.name,
-          e.toString(),
-          toolCallId: toolId,  // Pass ID
-        );
-      }
-    }
+        // Check if follow-up response has more tool calls
+        if (response.toolCalls != null && response.toolCalls!.isNotEmpty) {
+          if (round + 1 < _maxToolRounds) {
+            // Continue loop for next round
+            _logger.debug('Follow-up response has tool calls, continuing to round ${round + 2}');
+            continue;
+          } else {
+            _logger.warning('Max tool rounds reached ($_maxToolRounds), returning response with pending tool calls');
+          }
+        }
 
-    // Return error response if there are errors
-    if (toolResults.isEmpty && toolErrors.isNotEmpty) {
-      // Use the first error message
-      final firstErrorEntry = toolErrors.entries.first;
-      return LlmResponse(
-        text: "I tried to use a tool, but encountered an error: ${firstErrorEntry.value}",
-        metadata: {'error': firstErrorEntry.value, 'tool_call_id': firstErrorEntry.key},
-      );
-    }
-
-    // If there are tool results, create a follow-up request
-    if (toolResults.isNotEmpty) {
-      // Create message with tool result information
-      final toolResultsInfo = toolResults.entries.map((entry) =>
-      "Tool result for call ${entry.key}: ${entry.value}").join("\n");
-
-      // Collect tools for follow-up request (enables multi-round tool calling)
-      final availableTools = await _collectAvailableTools(
-        enableMcpTools: enableTools,
-        enablePlugins: enablePlugins,
-      );
-
-      // Build follow-up parameters with tools included
-      final followUpParameters = Map<String, dynamic>.from(parameters);
-      if (availableTools.isNotEmpty) {
-        final toolDescriptions = availableTools.map((tool) => {
-          'name': tool['name'],
-          'description': tool['description'],
-          'parameters': tool['inputSchema'],
-        }).toList();
-        followUpParameters['tools'] = toolDescriptions;
-      }
-
-      // Create follow-up request
-      final followUpRequest = LlmRequest(
-        prompt: "Based on the tool results, answer the original question: \"$userInput\"\n\nTool results:\n$toolResultsInfo",
-        history: chatSession.getMessagesForContext(),
-        parameters: followUpParameters,
-        context: context,
-      );
-
-      // Get follow-up response
-      try {
-        response = await llmProvider.complete(followUpRequest);
-      } catch (e) {
-        _logger.error('Error getting follow-up response: $e');
-        return LlmResponse(
-          text: "I tried to use tools to answer your question, but encountered an error processing the results: $e",
-          metadata: {'error': e.toString()},
-        );
+        // No more tool calls or max rounds reached
+        break;
       }
     }
 

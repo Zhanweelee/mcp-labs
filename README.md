@@ -202,16 +202,44 @@ Enhanced `mcp_llm` package with Deferred Tool Loading orchestration.
    Data Layer            Orchestration Layer
 ```
 
+## Resource Tool Bridge
+
+MCP resources are visible in system prompts but not callable by LLMs. Synthetic tools (`mcp_read_resource`, `mcp_list_resources`) bridge this gap.
+
+```dart
+final client = LlmClient(
+  llmProvider: provider,
+  mcpClient: mcpClient,
+);
+
+// Resources are automatically available as callable tools
+final response = await client.chat('Read the config resource');
+```
+
+## Multi-Round Tool Calling
+
+Enables the LLM to make multiple sequential tool calls until it has enough information to answer.
+
+```dart
+final client = LlmClient(
+  llmProvider: provider,
+  mcpClient: mcpClient,
+  maxToolRounds: 5,  // Allow up to 5 rounds (default: 1, max: 10)
+);
+
+final response = await client.chat('Compare weather in Seoul and Tokyo');
+// Round 1: LLM calls get_weather(Seoul)
+// Round 2: LLM calls get_weather(Tokyo)
+// Round 3: LLM returns comparison
+```
+
 ## Running Tests
 
 ```bash
-# mcp_client tests
-cd mcp_client_defer_loading
-dart test
-
-# mcp_llm tests
-cd mcp_llm_defer_loading
-dart test
+# All packages
+cd mcp_llm_resource_tools && dart test
+cd mcp_client_defer_loading && dart test
+cd mcp_llm_defer_loading && dart test
 ```
 
 ## Design Principles
